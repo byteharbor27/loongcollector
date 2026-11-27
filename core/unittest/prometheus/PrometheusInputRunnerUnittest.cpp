@@ -52,6 +52,7 @@ public:
     void TestHeartbeatResponses();
     void TestHeartbeatFailureDropsScrapeDelay();
     void TestRegistrationAndHeartbeatLoop();
+    void TestConfigDrivenSubscription();
     void TestStopDuringHeartbeat();
     void TestStopWaitsForRegistration();
     void TestStoppedTokenRejectsRequests();
@@ -90,6 +91,7 @@ protected:
             WriteLock lock(runner->mProjectRWLock);
             runner->mJobNameToProjectNameMap.clear();
         }
+        Timer::GetInstance()->Clear();
         runner->mHttpRequestSender = [](unique_ptr<HttpRequest>&&, HttpResponse& response) {
             response.SetStatusCode(200);
             return true;
@@ -621,10 +623,10 @@ void PrometheusInputRunnerUnittest::TestRegistrationAndHeartbeatLoop() {
     Json::Value config;
     config[prometheus::JOB_NAME] = "__loop_job";
     APSARA_TEST_TRUE(subscriber->Init(config));
-    {
-        WriteLock lock(runner->mSubscriberMapRWLock);
-        runner->mTargetSubscriberSchedulerMap[subscriber->GetId()] = subscriber;
-    }
+    runner->UpdateScrapeInput(subscriber, MetricLabels(), "default_project");
+    auto initialSubscription = subscriber->mFuture;
+    APSARA_TEST_TRUE_FATAL(initialSubscription != nullptr);
+    auto firstExecTime = subscriber->GetNextExecTime();
 
     int registerCount = 0;
     int heartbeatCount = 0;
@@ -632,7 +634,6 @@ void PrometheusInputRunnerUnittest::TestRegistrationAndHeartbeatLoop() {
     vector<chrono::steady_clock::duration> waits;
     auto now = chrono::steady_clock::time_point{};
     runner->mSteadyNow = [&]() { return now; };
-    shared_ptr<PromFuture<HttpResponse&, uint64_t>> initialSubscription;
     runner->mHttpRequestSender = [&](unique_ptr<HttpRequest>&& request, HttpResponse& response) {
         requests.push_back(request->mUrl);
         if (request->mUrl == prometheus::REGISTER_COLLECTOR_PATH) {
@@ -644,14 +645,13 @@ void PrometheusInputRunnerUnittest::TestRegistrationAndHeartbeatLoop() {
         } else {
             APSARA_TEST_EQUAL(prometheus::HEARTBEAT_COLLECTOR_PATH, request->mUrl);
             ++heartbeatCount;
+            APSARA_TEST_TRUE(initialSubscription == subscriber->mFuture);
+            APSARA_TEST_TRUE(firstExecTime == subscriber->GetNextExecTime());
             if (heartbeatCount == 1) {
-                initialSubscription = subscriber->mFuture;
-                APSARA_TEST_TRUE(initialSubscription != nullptr);
                 response.SetStatusCode(404);
                 response.AddHeader(prometheus::PROMETHEUS_COLLECTOR_PROTOCOL_VERSION, "v1");
                 *response.GetBody<string>() = R"({"msg":"NotRegistered"})";
             } else {
-                APSARA_TEST_TRUE(initialSubscription == subscriber->mFuture);
                 response.SetStatusCode(heartbeatCount == 2 ? 204 : 503);
             }
         }
@@ -684,6 +684,78 @@ void PrometheusInputRunnerUnittest::TestRegistrationAndHeartbeatLoop() {
                                                                chrono::seconds(prometheus::RefeshIntervalSeconds)};
     APSARA_TEST_TRUE(waits == expectedWaits);
     runner->RemoveScrapeInput(subscriber->GetId());
+}
+
+void PrometheusInputRunnerUnittest::TestConfigDrivenSubscription() {
+    auto runner = PrometheusInputRunner::GetInstance();
+    for (bool registrationFirst : {false, true}) {
+        SCOPED_TRACE(registrationFirst ? "registration before config" : "config before registration");
+        runner->mUnRegisterMs.store(0);
+        HttpResponse registrationResponse;
+        registrationResponse.SetStatusCode(200);
+        *registrationResponse.GetBody<string>() = R"({"unRegisterMs":"12000"})";
+        if (registrationFirst) {
+            runner->OnInitialRegistration(registrationResponse);
+        }
+
+        Json::Value config;
+        config[prometheus::JOB_NAME] = "__config_driven_job";
+        auto subscriber = make_shared<TargetSubscriberScheduler>();
+        APSARA_TEST_TRUE(subscriber->Init(config));
+        runner->UpdateScrapeInput(subscriber, MetricLabels(), "default_project");
+        APSARA_TEST_TRUE_FATAL(subscriber->mFuture != nullptr);
+
+        if (!registrationFirst) {
+            auto subscription = subscriber->mFuture;
+            auto execTime = subscriber->GetNextExecTime();
+            HttpResponse response;
+            response.SetStatusCode(404);
+            APSARA_TEST_TRUE(subscription->Process(response, GetCurrentTimeInMilliSeconds()));
+            APSARA_TEST_TRUE(subscription != subscriber->mFuture);
+            APSARA_TEST_TRUE(execTime + chrono::seconds(prometheus::RefeshIntervalSeconds)
+                             == subscriber->GetNextExecTime());
+
+            subscription = subscriber->mFuture;
+            execTime = subscriber->GetNextExecTime();
+            runner->OnInitialRegistration(registrationResponse);
+            APSARA_TEST_TRUE(subscription == subscriber->mFuture);
+            APSARA_TEST_TRUE(execTime == subscriber->GetNextExecTime());
+        }
+        APSARA_TEST_EQUAL(11000UL, runner->mUnRegisterMs.load());
+
+        for (int status : {200, 304, 503, 0}) {
+            SCOPED_TRACE(to_string(status));
+            auto subscription = subscriber->mFuture;
+            auto execTime = subscriber->GetNextExecTime();
+            HttpResponse response;
+            response.SetStatusCode(status);
+            if (status == 200) {
+                *response.GetBody<string>() = "[]";
+            } else if (status == 0) {
+                response.SetNetworkStatus(NetworkCode::Timeout, "subscription timeout");
+            }
+            APSARA_TEST_TRUE(subscription->Process(response, GetCurrentTimeInMilliSeconds()));
+            APSARA_TEST_TRUE(subscription != subscriber->mFuture);
+            APSARA_TEST_TRUE(execTime + chrono::seconds(prometheus::RefeshIntervalSeconds)
+                             == subscriber->GetNextExecTime());
+
+            auto nextSubscription = subscriber->mFuture;
+            APSARA_TEST_TRUE(subscription->Process(response, GetCurrentTimeInMilliSeconds()));
+            APSARA_TEST_TRUE(nextSubscription == subscriber->mFuture);
+            APSARA_TEST_TRUE(execTime + chrono::seconds(prometheus::RefeshIntervalSeconds)
+                             == subscriber->GetNextExecTime());
+        }
+
+        auto subscription = subscriber->mFuture;
+        auto execTime = subscriber->GetNextExecTime();
+        runner->RemoveScrapeInput(subscriber->GetId());
+        HttpResponse response;
+        response.SetStatusCode(304);
+        APSARA_TEST_TRUE(subscription->Process(response, GetCurrentTimeInMilliSeconds()));
+        APSARA_TEST_TRUE(subscription == subscriber->mFuture);
+        APSARA_TEST_TRUE(execTime == subscriber->GetNextExecTime());
+        APSARA_TEST_FALSE(runner->HasRegisteredPlugins());
+    }
 }
 
 void PrometheusInputRunnerUnittest::TestRepeatedNotRegisteredUsesHeartbeatCadence() {
@@ -1027,6 +1099,7 @@ UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestSendHeartbeatRequest)
 UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestHeartbeatResponses)
 UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestHeartbeatFailureDropsScrapeDelay)
 UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestRegistrationAndHeartbeatLoop)
+UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestConfigDrivenSubscription)
 UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestStopDuringHeartbeat)
 UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestStopWaitsForRegistration)
 UNIT_TEST_CASE(PrometheusInputRunnerUnittest, TestStoppedTokenRejectsRequests)

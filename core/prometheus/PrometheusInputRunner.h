@@ -105,7 +105,6 @@ private:
     PrometheusAgentInfo RefreshAgentInfoSnapshot();
 
     void CancelAllTargetSubscriber();
-    void SubscribeOnce();
 
     std::string GetAllProjects();
 

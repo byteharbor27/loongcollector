@@ -261,13 +261,12 @@ void PrometheusInputRunner::OnInitialRegistration(const HttpResponse& response) 
                 uint64_t unRegisterMs{};
                 StringTo(timestamp, unRegisterMs);
                 mUnRegisterMs.store(unRegisterMs);
-                // Preserve the one-second upgrade compensation before the first subscription.
+                // Preserve the one-second upgrade compensation.
                 mUnRegisterMs -= 1000;
                 LOG_INFO(sLogger, ("unRegisterMs", ToString(mUnRegisterMs)));
             }
         }
     }
-    SubscribeOnce();
 }
 
 chrono::steady_clock::time_point PrometheusInputRunner::SteadyNow() const {
@@ -463,13 +462,6 @@ void PrometheusInputRunner::CancelAllTargetSubscriber() {
     ReadLock lock(mSubscriberMapRWLock);
     for (auto& it : mTargetSubscriberSchedulerMap) {
         it.second->Cancel();
-    }
-}
-
-void PrometheusInputRunner::SubscribeOnce() {
-    ReadLock lock(mSubscriberMapRWLock);
-    for (auto& [k, v] : mTargetSubscriberSchedulerMap) {
-        v->SubscribeOnce(std::chrono::steady_clock::now());
     }
 }
 

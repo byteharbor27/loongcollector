@@ -46,7 +46,6 @@ public:
     bool operator<(const TargetSubscriberScheduler& other) const;
 
     void OnSubscription(HttpResponse&, uint64_t);
-    void SubscribeOnce(std::chrono::steady_clock::time_point execTime);
 
     bool IsHostOnlyMode() const;
     void ScheduleHostOnlyTargets();

@@ -455,17 +455,6 @@ void TargetSubscriberScheduler::Cancel() {
     CancelAllScrapeScheduler();
 }
 
-void TargetSubscriberScheduler::SubscribeOnce(std::chrono::steady_clock::time_point execTime) {
-    auto future = std::make_shared<PromFuture<HttpResponse&, uint64_t>>();
-    future->AddDoneCallback([this](HttpResponse& response, uint64_t timestampNanoSec) {
-        this->OnSubscription(response, timestampNanoSec);
-        return true;
-    });
-    mFuture = future;
-    auto event = BuildSubscriberTimerEvent(execTime);
-    Timer::GetInstance()->PushEvent(std::move(event));
-}
-
 std::unique_ptr<TimerEvent>
 TargetSubscriberScheduler::BuildSubscriberTimerEvent(std::chrono::steady_clock::time_point execTime) {
     map<string, string> httpHeader;
